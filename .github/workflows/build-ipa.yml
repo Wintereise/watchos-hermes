@@ -112,7 +112,7 @@ jobs:
       SHA: ${{ needs.sync.outputs.after }}
       SHORT: ${{ needs.sync.outputs.short }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.sync.outputs.after }}
 
@@ -144,7 +144,7 @@ jobs:
         run: scripts/create_ipa.sh
 
       - name: Upload IPA
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: HermesEnabler-${{ needs.sync.outputs.short }}-unsigned-ipa
           path: build/ipa/HermesEnabler.ipa
@@ -162,7 +162,7 @@ jobs:
       SHA: ${{ needs.sync.outputs.after }}
       SHORT: ${{ needs.sync.outputs.short }}
     steps:
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v8
         with:
           name: HermesEnabler-${{ needs.sync.outputs.short }}-unsigned-ipa
 
