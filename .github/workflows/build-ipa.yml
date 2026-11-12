@@ -1,0 +1,189 @@
+name: Build unsigned IPA
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Build even when main has not changed
+        type: boolean
+        default: false
+  push:
+    branches:
+      - ci
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-ipa
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      before: ${{ steps.sync.outputs.before }}
+      after: ${{ steps.sync.outputs.after }}
+      short: ${{ steps.decide.outputs.short }}
+      build: ${{ steps.decide.outputs.build }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Fast-forward main from upstream
+        id: sync
+        run: |
+          set -euo pipefail
+          upstream="$(gh api "repos/$REPO" -q .parent.full_name)"
+          [[ -n "$upstream" ]] || { echo "::error::$REPO has no parent repository" >&2; exit 1; }
+          before="$(gh api "repos/$REPO/commits/main" -q .sha)"
+          upstream_sha="$(gh api "repos/$upstream/commits/main" -q .sha)"
+          echo "main before: $before"
+          echo "$upstream main: $upstream_sha"
+
+          # Refuse anything but a fast-forward. merge-upstream would make a
+          # merge commit on a diverged main, so check first.
+          status="$(gh api "repos/$REPO/compare/main...${upstream/\//:}:main" -q .status)"
+          echo "compare main...upstream: $status"
+          case "$status" in
+            identical|ahead) ;;
+            *)
+              echo "::error::main has diverged from $upstream main ($status). Fix main by hand; this workflow never forces." >&2
+              exit 1
+              ;;
+          esac
+
+          gh api -X POST "repos/$REPO/merge-upstream" -f branch=main | tee merge.json
+          merge_type="$(jq -r .merge_type merge.json)"
+          case "$merge_type" in
+            none|fast-forward) ;;
+            *) echo "::error::merge-upstream did a '$merge_type' merge, expected fast-forward" >&2; exit 1 ;;
+          esac
+
+          after="$(gh api "repos/$REPO/commits/main" -q .sha)"
+          echo "main after: $after"
+          [[ "$after" == "$upstream_sha" ]] || {
+            echo "::error::main is $after after sync, upstream is $upstream_sha" >&2
+            exit 1
+          }
+          echo "before=$before" >> "$GITHUB_OUTPUT"
+          echo "after=$after" >> "$GITHUB_OUTPUT"
+
+      - name: Decide whether to build
+        id: decide
+        env:
+          BEFORE: ${{ steps.sync.outputs.before }}
+          AFTER: ${{ steps.sync.outputs.after }}
+          FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.force }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          short="${AFTER:0:7}"
+          reasons=()
+          [[ "$BEFORE" != "$AFTER" ]] && reasons+=("main moved")
+          [[ "$FORCE" == "true" ]] && reasons+=("forced")
+          [[ "$EVENT" == "push" ]] && reasons+=("push to ci")
+          if ! gh release view "build-$short" -R "$REPO" >/dev/null 2>&1; then
+            reasons+=("no build-$short release")
+          fi
+          if (( ${#reasons[@]} )); then
+            build=true
+            echo "Building $short: ${reasons[*]}" | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            build=false
+            echo "Skipping build: release build-$short already exists for main $AFTER" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "short=$short" >> "$GITHUB_OUTPUT"
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: sync
+    if: needs.sync.outputs.build == 'true'
+    # The project is saved by Xcode 27, so it needs the Xcode 27 image
+    # (public preview). Move to macos-latest once that image ships Xcode 27.
+    runs-on: xcode-27
+    timeout-minutes: 45
+    env:
+      SHA: ${{ needs.sync.outputs.after }}
+      SHORT: ${{ needs.sync.outputs.short }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.sync.outputs.after }}
+
+      - name: Select newest Xcode
+        run: |
+          newest=""
+          newest_version="0"
+          # Real installs only; the versioned aliases are symlinks.
+          while IFS= read -r app; do
+            version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")"
+            if [[ "$(printf '%s\n%s\n' "$newest_version" "$version" | sort -V | tail -1)" == "$version" ]]; then
+              newest="$app"
+              newest_version="$version"
+            fi
+          done < <(find /Applications -maxdepth 1 -type d -name 'Xcode*.app')
+          [[ -n "$newest" ]] || { echo "No Xcode found" >&2; exit 1; }
+          echo "Selecting $newest ($newest_version)"
+          sudo xcode-select -s "$newest/Contents/Developer"
+          xcodebuild -version
+
+      - name: Ensure watchOS platform
+        run: |
+          xcodebuild -showsdks
+          if ! xcodebuild -showsdks | grep -q -- '-sdk watchos'; then
+            xcodebuild -downloadPlatform watchOS
+          fi
+
+      - name: Build IPA
+        run: scripts/create_ipa.sh
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v5
+        with:
+          name: HermesEnabler-${{ needs.sync.outputs.short }}-unsigned-ipa
+          path: build/ipa/HermesEnabler.ipa
+          if-no-files-found: error
+
+  release:
+    needs: [sync, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      SHA: ${{ needs.sync.outputs.after }}
+      SHORT: ${{ needs.sync.outputs.short }}
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          name: HermesEnabler-${{ needs.sync.outputs.short }}-unsigned-ipa
+
+      - name: Publish release
+        run: |
+          set -euo pipefail
+          tag="build-$SHORT"
+          subject="$(gh api "repos/$GH_REPO/commits/$SHA" -q '.commit.message' | head -1)"
+          {
+            echo "Unsigned IPA built from main @ $SHA."
+            echo
+            echo "Upstream commit: $subject"
+          } > notes.md
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag exists; replacing the IPA"
+            gh release upload "$tag" HermesEnabler.ipa --clobber
+            gh release edit "$tag" --latest --notes-file notes.md
+          else
+            gh release create "$tag" HermesEnabler.ipa \
+              --target "$SHA" \
+              --title "HermesEnabler $SHORT ($(date -u +%F))" \
+              --notes-file notes.md \
+              --latest
+          fi
